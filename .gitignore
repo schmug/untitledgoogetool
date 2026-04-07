@@ -11,8 +11,7 @@ token_cache.bin
 .vscode/
 debug.log
 error.log
-.d4iot_conf
-.msgtrace_info
+*.json.key
 *.aes
 *.auth*
 *_auth*

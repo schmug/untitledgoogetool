@@ -13,7 +13,6 @@ from goosey.auth import auth
 from goosey.honk import honk, autohonk
 from goosey.conf import genconf
 from goosey.csv import goosey_csv
-from goosey.d4iot import d4iot
 import goosey
 
 
@@ -29,7 +28,6 @@ def main():
                "honk": honk,
                "autohonk": autohonk,
                "conf": genconf,
-               "d4iot": d4iot,
                "csv": goosey_csv,
                "--version": version})
 if __name__ == "__main__":

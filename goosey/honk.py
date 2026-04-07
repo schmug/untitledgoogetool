@@ -2,12 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """Untitled Goose Tool: Honk!
-This module performs data collection of various data sources from an Azure/M365 environment.
+This module performs data collection of various data sources from a Google Workspace / GCP environment.
 """
 
-from mimetypes import init
 import aiohttp
-import argparse
 import asyncio
 import configparser
 import json
@@ -17,13 +15,13 @@ import time
 import warnings
 from multiprocessing import Process
 
-from goosey.entra_id_datadumper import EntraIdDataDumper
-from goosey.azure_dumper import AzureDataDumper
+from goosey.google_directory_dumper import GoogleDirectoryDumper
+from goosey.gmail_dumper import GmailDumper
+from goosey.gcp_dumper import GCPDataDumper
+from goosey.alert_center_dumper import AlertCenterDumper
 from goosey.datadumper import DataDumper
-from goosey.m365_datadumper import M365DataDumper
-from goosey.mde_datadumper import MDEDataDumper
 from goosey.utils import *
-from goosey.auth import auth as gooseyauth
+from goosey.auth import auth as gooseyauth, get_google_credentials
 
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -33,13 +31,15 @@ warnings.simplefilter('ignore')
 logger = setup_logger(__name__, debug=False)
 data_calls = {}
 
-async def run(args, config, auth, init_sections, auth_un_pw=None):
+async def run(args, config, auth, init_sections):
     """Main async run loop
 
     :param args: argparse object with populated namespace
     :type args: Namespace argparse object
-    :param auth: All token auth credentials
+    :param auth: All auth credentials
     :type auth: dict
+    :param init_sections: Sections to initialize
+    :type init_sections: list
     :return: None
     :rtype: None
     """
@@ -50,50 +50,55 @@ async def run(args, config, auth, init_sections, auth_un_pw=None):
 
     session = aiohttp.ClientSession(trust_env=True)
 
-    msft_graph_app_auth = {}
-    loganalytics_app_auth = {}
+    # Build Google credentials from auth data
+    google_auth = auth.get('google_auth', {})
+    credentials = get_google_credentials(google_auth)
 
-    o365_app_auth = auth["app_auth"]["outlook_office_api"]
-    msft_graph_app_auth = auth["app_auth"]["graph_api"]
-    mgmt_app_auth = auth["app_auth"]["resource_manager"]
-    msft_security_center_auth = auth["app_auth"]["securitycenter_api"]
-    loganalytics_app_auth = auth["app_auth"]["log_analytics_api"]
-    msft_security_auth = auth["app_auth"]["security_api"]
+    maindumper = DataDumper(args.output_dir, args.reports_dir, {}, session, args.debug)
 
-    maindumper = DataDumper(args.output_dir, args.reports_dir, msft_graph_app_auth, session, args.debug)
-
-    m365, entraid, azure, mde = False, False, False, False
+    directory, gmail, gcp, alerts = False, False, False, False
 
     if args.dry_run:
-        m365dumper = maindumper
-        entraiddumper = maindumper
-        azure_dumper = maindumper
-        mdedumper = maindumper
-
+        directory_dumper = maindumper
+        gmail_dumper = maindumper
+        gcp_dumper = maindumper
+        alerts_dumper = maindumper
     else:
-        if 'm365' in init_sections:
-            m365dumper = M365DataDumper(args.output_dir, args.reports_dir, msft_graph_app_auth, maindumper.ahsession, config, args.debug, o365_app_auth)
-            m365 = True
-        if 'entraid' in init_sections:
-            entraiddumper = EntraIdDataDumper(args.output_dir, args.reports_dir, msft_graph_app_auth, maindumper.ahsession, config, args.debug)
-            entraid = True
-        if 'azure' in init_sections:
-            azure_dumper = AzureDataDumper(args.output_dir, args.reports_dir, maindumper.ahsession, mgmt_app_auth, config, auth_un_pw, loganalytics_app_auth, args.debug)
-            azure = True
-        if 'mde' in init_sections:
-            mdedumper = MDEDataDumper(args.output_dir, args.reports_dir, msft_security_center_auth, msft_security_auth, maindumper.ahsession, config, args.debug)
-            mde = True
+        if 'directory' in init_sections:
+            directory_dumper = GoogleDirectoryDumper(
+                args.output_dir, args.reports_dir, credentials,
+                maindumper.ahsession, config, args.debug
+            )
+            directory = True
+        if 'gmail' in init_sections:
+            gmail_dumper = GmailDumper(
+                args.output_dir, args.reports_dir, credentials,
+                maindumper.ahsession, config, args.debug
+            )
+            gmail = True
+        if 'gcp' in init_sections:
+            gcp_dumper = GCPDataDumper(
+                args.output_dir, args.reports_dir, credentials,
+                maindumper.ahsession, config, args.debug
+            )
+            gcp = True
+        if 'alerts' in init_sections:
+            alerts_dumper = AlertCenterDumper(
+                args.output_dir, args.reports_dir, credentials,
+                maindumper.ahsession, config, args.debug
+            )
+            alerts = True
 
     async with maindumper.ahsession as ahsession:
         tasks = []
-        if m365:
-            tasks.extend(m365dumper.data_dump(data_calls['m365'], "m365"))
-        if entraid:
-            tasks.extend(entraiddumper.data_dump(data_calls['entraid'], "entraid"))
-        if azure:
-            tasks.extend(azure_dumper.data_dump(data_calls['azure'], "azure"))
-        if mde:
-            tasks.extend(mdedumper.data_dump(data_calls['mde'], "mde"))
+        if directory:
+            tasks.extend(directory_dumper.data_dump(data_calls['directory'], "directory"))
+        if gmail:
+            tasks.extend(gmail_dumper.data_dump(data_calls['gmail'], "gmail"))
+        if gcp:
+            tasks.extend(gcp_dumper.data_dump(data_calls['gcp'], "gcp"))
+        if alerts:
+            tasks.extend(alerts_dumper.data_dump(data_calls['alerts'], "alerts"))
 
         honk_results = await asyncio.gather(*tasks)
         error_occured = False
@@ -119,7 +124,7 @@ def parse_config(configfile, args, auth=None):
     config.read(configfile)
 
     if not auth:
-        sections = ['azure', 'm365', 'entraid', 'mde']
+        sections = ['directory', 'gmail', 'gcp', 'alerts']
     else:
         sections = ['auth']
 
@@ -132,23 +137,22 @@ def parse_config(configfile, args, auth=None):
                 data_calls[section][key] = True
                 init_sections.append(section)
 
-    print(args.__dict__)
-    if args.azure:
-        for item in [x.replace('dump_', '') for x in dir(AzureDataDumper) if x.startswith('dump_')]:
-            data_calls['azure'][item] = True
-        init_sections.append("azure")
-    if args.entraid:
-        for item in [x.replace('dump_', '') for x in dir(EntraIdDataDumper) if x.startswith('dump_')]:
-            data_calls['entraid'][item] = True
-        init_sections.append("entraid")
-    if args.m365:
-        for item in [x.replace('dump_', '') for x in dir(M365DataDumper) if x.startswith('dump_')]:
-            data_calls['m365'][item] = True
-        init_sections.append("m365")
-    if args.mde:
-        for item in [x.replace('dump_', '') for x in dir(MDEDataDumper) if x.startswith('dump_')]:
-            data_calls['mde'][item] = True
-        init_sections.append("mde")
+    if args.directory:
+        for item in [x.replace('dump_', '') for x in dir(GoogleDirectoryDumper) if x.startswith('dump_')]:
+            data_calls['directory'][item] = True
+        init_sections.append("directory")
+    if args.gmail:
+        for item in [x.replace('dump_', '') for x in dir(GmailDumper) if x.startswith('dump_')]:
+            data_calls['gmail'][item] = True
+        init_sections.append("gmail")
+    if args.gcp:
+        for item in [x.replace('dump_', '') for x in dir(GCPDataDumper) if x.startswith('dump_')]:
+            data_calls['gcp'][item] = True
+        init_sections.append("gcp")
+    if args.alerts:
+        for item in [x.replace('dump_', '') for x in dir(AlertCenterDumper) if x.startswith('dump_')]:
+            data_calls['alerts'][item] = True
+        init_sections.append("alerts")
 
     logger.debug(json.dumps(data_calls, indent=2))
     return config, init_sections
@@ -160,13 +164,13 @@ def honk(authfile=".ugt_auth",
          reports_dir="reports",
          debug=False,
          dry_run=False,
-         azure=False,
-         entraid=False,
-         m365=False,
-         mde=False,
+         directory=False,
+         gmail=False,
+         gcp=False,
+         alerts=False,
          encryption_pw=None):
     """
-    Untitled Goose Tool Information Gathering
+    Untitled Goose Tool Information Gathering (Google Workspace)
 
     Args:
         authfile: File to store the authentication tokens and cookies
@@ -176,10 +180,10 @@ def honk(authfile=".ugt_auth",
         reports_dir: Directory for storing debugging/informational logs
         debug: Enable debug logging
         dry_run: Dry run (do not do any API calls)
-        azure: Set all of the Azure calls to true
-        entraid: Set all of the Entra ID calls to true
-        m365: Set all of the M365 calls to true
-        mde: Set all of the MDE calls to true
+        directory: Set all of the Google Directory calls to true
+        gmail: Set all of the Gmail calls to true
+        gcp: Set all of the GCP calls to true
+        alerts: Set all of the Alert Center calls to true
         encryption_pw: Password for the auth file encryption. SHOULD ONLY BE USED WITH AUTOHONK
     """
     global logger
@@ -187,20 +191,20 @@ def honk(authfile=".ugt_auth",
 
     logger = setup_logger(__name__, args.debug)
 
-    auth_un_pw, auth = get_authfile(authfile=args.auth, ugt_authfile=args.authfile, logger=logger, encryption_pw=encryption_pw)
+    auth_un_pw, auth_data = get_authfile(authfile=args.auth, ugt_authfile=args.authfile, logger=logger, encryption_pw=encryption_pw)
 
     check_output_dir(args.output_dir, logger)
     check_output_dir(args.reports_dir, logger)
-    check_output_dir(f'{args.output_dir}{os.path.sep}azure', logger)
-    check_output_dir(f'{args.output_dir}{os.path.sep}m365', logger)
-    check_output_dir(f'{args.output_dir}{os.path.sep}entraid', logger)
-    check_output_dir(f'{args.output_dir}{os.path.sep}mde', logger)
+    check_output_dir(f'{args.output_dir}{os.path.sep}directory', logger)
+    check_output_dir(f'{args.output_dir}{os.path.sep}gmail', logger)
+    check_output_dir(f'{args.output_dir}{os.path.sep}gcp', logger)
+    check_output_dir(f'{args.output_dir}{os.path.sep}alerts', logger)
     config, init_sections = parse_config(args.config, args)
 
     logger.info("Goosey beginning to honk.")
     seconds = time.perf_counter()
     try:
-        asyncio.run(run(args, config, auth, init_sections, auth_un_pw=auth_un_pw))
+        asyncio.run(run(args, config, auth_data, init_sections))
     except RuntimeError as e:
         sys.exit(1)
     elapsed = time.perf_counter() - seconds
@@ -212,10 +216,10 @@ def autohonk(authfile=".ugt_auth",
          output_dir="output",
          reports_dir="reports",
          debug=False,
-         azure=False,
-         entraid=False,
-         m365=False,
-         mde=False,
+         directory=False,
+         gmail=False,
+         gcp=False,
+         alerts=False,
          insecure=False):
     """
     Untitled Goose Tool Information Gathering. With auto authentication!
@@ -228,11 +232,10 @@ def autohonk(authfile=".ugt_auth",
         output_dir: Directory for storing the results
         reports_dir: Directory for storing debugging/informational logs
         debug: Enable debug logging
-        dry_run: Dry run (do not do any API calls)
-        azure: Set all of the Azure calls to true
-        entraid: Set all of the Entra ID calls to true
-        m365: Set all of the M365 calls to true
-        mde: Set all of the MDE calls to true
+        directory: Set all of the Google Directory calls to true
+        gmail: Set all of the Gmail calls to true
+        gcp: Set all of the GCP calls to true
+        alerts: Set all of the Alert Center calls to true
         insecure: Disable secure authentication handling (file encryption)
     """
     # auth and honk in a loop
@@ -253,10 +256,10 @@ def autohonk(authfile=".ugt_auth",
         "output_dir": output_dir,
         "reports_dir": reports_dir,
         "debug": debug,
-        "azure": azure,
-        "entraid": entraid,
-        "m365": m365,
-        "mde": mde,
+        "directory": directory,
+        "gmail": gmail,
+        "gcp": gcp,
+        "alerts": alerts,
         "encryption_pw": encryption_pw
     }
     # Endless loop to keep authing and honking
@@ -274,5 +277,3 @@ def autohonk(authfile=".ugt_auth",
         elapsed = time.perf_counter() - seconds
         if elapsed <= 5:
             break
-
-

@@ -18,7 +18,6 @@ import pytz
 
 from colored import stylize, attr, fg
 from datetime import datetime, timedelta, date
-from tracemalloc import start
 from logging import handlers
 import dateutil.parser
 
@@ -135,36 +134,6 @@ class obj(object):
     def __init__(self, dict_):
         self.__dict__.update(dict_)
 
-def get_endpoints(gcc=False, gcc_high=False):
-    """
-    Return a dictionary of urls for authentication and log pulling based on the tenant type
-    """
-    urls_dict = {}
-    # default endpoints
-    urls_dict["outlook_office_api"] = "https://outlook.office.com"
-    urls_dict["graph_api"] = "https://graph.microsoft.com"
-    urls_dict["blob_api"] = "blob.core.windows.net"
-    urls_dict["resource_manager"] = "https://management.azure.com"
-    urls_dict["log_analytics_api"] = "https://api.loganalytics.io"
-    urls_dict["securitycenter_api"] = "https://api.securitycenter.windows.com"
-    urls_dict["security_api"] = "https://api.security.microsoft.com"
-    urls_dict["authority_api"] = "https://login.microsoftonline.com"
-    # If using a gcc tenant
-    if gcc:
-        urls_dict["securitycenter_api"] = "https://api-gcc.securitycenter.microsoft.us"
-        urls_dict["security_api"] = "https://api-gcc.security.microsoft.us"
-    # If using a gcc high tenant
-    elif gcc_high:
-        urls_dict["outlook_office_api"] = "https://outlook.office365.us"
-        urls_dict["graph_api"] = "https://graph.microsoft.us"
-        urls_dict["blob_api"] = "blob.core.usgovcloudapi.net"
-        urls_dict["resource_manager"] = "https://management.usgovcloudapi.net"
-        urls_dict["log_analytics_api"] = "https://api.loganalytics.us"
-        urls_dict["securitycenter_api"] = "https://api-gov.securitycenter.microsoft.us"
-        urls_dict["security_api"] = "https://api-gov.security.microsoft.us"
-        urls_dict["authority_api"] = "https://login.microsoftonline.us"
-    return urls_dict
-
 def dict2obj(d):
     return json.loads(json.dumps(d), object_hook=obj)
 
@@ -267,299 +236,182 @@ def check_output_dir(output_dir, logger):
         logger.error(f'{output_dir} exists but is not a directory or you do not have permissions to access. Exiting.')
         sys.exit(1)
 
-async def get_nextlink(url, outfile, session, logger, auth):
-    retries = 50
-    while url:
+
+async def google_api_call_with_retry(service_call, logger, retries=5, delay=60):
+    """
+    Execute a Google API call with retry logic for rate limiting and transient errors.
+
+    Args:
+        service_call: A callable that executes the API request (e.g., lambda: service.users().list(...).execute())
+        logger: Logger instance
+        retries: Number of retries
+        delay: Delay in seconds between retries
+
+    Returns:
+        The API response dict
+    """
+    from googleapiclient.errors import HttpError
+    for attempt in range(retries):
         try:
-            if '$skiptoken' in url:
-                skiptoken = url.split('skiptoken=')[1]
-            elif '$skip' in url:
-                skiptoken = url.split('skip=')[1]
-            if not skiptoken == '50':
-                logger.debug('Getting nextLink %s' % (skiptoken))
-
-            header = {'Authorization': '%s %s' % (auth['token_type'], auth['access_token'])}
-            async with session.get(url, headers=header, raise_for_status=True, timeout=600) as r2:
-                result2 = await r2.json()
-                if 'value' in result2:
-                    finalvalue = result2['value']
-                elif 'value' not in result2:
-                    finalvalue = result2
-                if not skiptoken == '50':
-                    logger.debug(f'Received nextLink {skiptoken} {url}')
-
-                with open(outfile, 'a+', encoding='utf-8') as f:
-                    logger.debug(f"Writing to {outfile}")
-                    f.write("\n".join([json.dumps(x) for x in finalvalue]) + '\n')
-                    f.flush()
-                    os.fsync(f)
-                if '@odata.nextLink' in result2:
-                    url = result2['@odata.nextLink']
-                    retries = 50
-                else:
-                    url = None
-        except asyncio.TimeoutError:
-            logger.error('TimeoutError has occurred on {}'.format(skiptoken))
-        except Exception as e:
-            if retries == 0:
-                logger.info('Error. No more retries on {}.'.format(skiptoken))
-                url = None
-            else:
-                logger.info('Error. Retrying {} up to {} more times'.format(skiptoken, retries))
-                try:
-                    if e.status:
-                        if e.status == 429:
-                            logger.info('Sleeping for 60 seconds because of API throttle limit was exceeded.')
-                            await asyncio.sleep(60)
-                        elif e.status == 401:
-                            logger.error('Unauthorized message received. Exiting calls.')
-                            logger.error("Check auth to make sure it's not expired.")
-                            return
-                        else:
-                            logger.info('Error: {}'.format(str(e)))
-                        retries -= 1
-                except AttributeError as a:
-                    logger.error('Error on nextLink retrieval {}: {}'.format(skiptoken, str(e)))
-
-async def run_kql_query(query, start, end, bounds, url, app_auth, logger, session, threshold=10000, summarize=False):
-    """
-    Run an advanced query or hunt and return the result
-    """
-    # errors from the query that will cause the dumper to sleep
-    sleep_errors = ["Server disconnected", "Cannot connect", "WinError 10054"]
-    # errors from the query that will cause the dumper to cut the tim in half
-    slice_errors = ['exceeded the allowed limits', 'exceeded the allowed result size', 'Rate limit']
-    # Errors in the authentication token
-    auth_errors = ['TokenExpired']
-
-
-    header = {
-        'Authorization': '%s %s' % (app_auth['token_type'], app_auth['access_token']),
-        'Content-Type': 'application/json'
-    }
-    # Apply time filters
-    full_query = query
-    if start and not end:
-        full_query += f"|where TimeGenerated > datetime({start})"
-    elif end and not start:
-        full_query += f"|where TimeGenerated < datetime({end})"
-    elif end and start:
-        full_query += f"|where TimeGenerated between(datetime({start})..datetime({end}))"
-
-    if summarize:
-        full_query += f"| summarize Count=count(), FirstEvent=min(TimeGenerated), LastEvent=max(TimeGenerated)"
-    if query.startswith("search \"*\""):
-        full_query += " by $table"
-
-    logger.debug(full_query)
-    payload = {"query": full_query}
-    data=json.dumps(payload)
-    result = None
-    err = None
-    try:
-        async with session.request("POST", url=url, headers=header, data=data) as r:
-            result = await r.json()
-            if r.status == 401:
-                logger.error("Detected 401 unauthorized, exiting.")
+            return service_call()
+        except HttpError as e:
+            if e.resp.status == 429:
+                logger.info(f"Rate limited. Sleeping for {delay} seconds before retry {attempt+1}/{retries}...")
+                await asyncio.sleep(delay)
+            elif e.resp.status == 403:
+                logger.warning(f"Permission denied: {str(e)}")
+                return None
+            elif e.resp.status == 401:
+                logger.error(f"Unauthorized: {str(e)}. Please re-auth.")
                 sys.exit(1)
-            elif r.status == 429:
-                error = result['error']
-                message = error['message']
-                logger.debug(message)
-                await asyncio.sleep(30)
-                err = message
-                result = None
+            elif e.resp.status >= 500:
+                logger.warning(f"Server error ({e.resp.status}). Retrying in {delay}s...")
+                await asyncio.sleep(delay)
             else:
-                if "error" in result:
-                    err = result["error"]["message"]
-                if "tables" in result:
-                    result = result["tables"]
-                else:
-                    logger.debug(result)
-                    result = None
-
-    except Exception as e:
-        logger.error('Error on retrieval: {}'.format(str(e)))
-        err = str(e)
-
-    results = map_results(result)
-
-    # Insert a new record into the bounds.
-    count = None
-    done_status = False
-    if summarize and results:
-        count = results[0]["Count"]
-    elif results:
-        count = len(results)
-    if count != None:
-        done_status = count < threshold
-    if bounds:
-        bounds = insert_bounds_record({"count": count,
-                  "start": start,
-                  "end": end,
-                  "done_status": done_status}, bounds)
-    if err:
-        logger.debug(err)
-    if err is TimeoutError or \
-       err and any(e in err for e in slice_errors) or \
-       (count and count >= threshold):
-       new_end_ts = start.timestamp() + ((end.timestamp() - start.timestamp())/2)
-       end = datetime.fromtimestamp(new_end_ts, utc)
-    elif err and any(e in err for e in sleep_errors):
-        await asyncio.sleep(int(60))
-    elif err and any(e in err for e in auth_errors):
-        sys.exit(1)
-
-    return results, err, end, bounds
-
-def map_results(kql_results):
-    """
-    Description:
-        Convert the result resturned from a kql query to a dictionary
-
-    Arguments:
-        kql_results: list of column names and rows that need to be mapped
-
-    Returns:
-        The mapped dictionary
-    """
-    if not kql_results:
-        return None
-    results = []
-    for row in kql_results[0]["rows"]:
-        new_entry = {}
-        for idx, column in enumerate(kql_results[0]["columns"]):
-            new_entry[column["name"]] = row[idx]
-        results.append(new_entry)
-    return results
-
-def insert_bounds_record(record, bounds):
-    """
-    Description:
-        Add a record to the sorted  bounds_state.
-
-    Arguments:
-        record: Tuple of (start, end, count, done_status)
-        bounds: Time Bounds Dictionary
-
-    Returns:
-        bounds. The updated time bounds dictionary
-    """
-    # Perform insert
-    #self.logger.debug(f"Inserting Record {record}")
-
-    if len(bounds) == 0:
-        bounds.append(record)
-        return bounds
-    done_idx = 0
-    for idx, cur_record in enumerate(bounds):
-        # Only situation for an insert here should be where a record already exists with that start
-        # time and we just shrink the bounds
-        if record["start"] == cur_record["start"] and record["end"] <= cur_record["end"]:
-            cur_record["start"] = record["end"]
-            # if the count is less than 0 then it is not accurate
-            if cur_record["count"] != None and cur_record["count"] >= 0 \
-               and record["count"] != None and record["count"] > 0:
-                cur_record["count"] = max(0,cur_record["count"] - record["count"])
-
-            new_records = [record.copy(), cur_record.copy()]
-            if (cur_record["count"] != None and cur_record["count"] == 0) or cur_record["start"] == cur_record["end"]:
-                record["end"] = cur_record["end"]
-                new_records = [record.copy()]
-            bounds = bounds[done_idx:idx] + new_records + bounds[idx+1:]
-            #self.logger.debug(f"Record inserted at index {idx}")
-            break
-    idx = 0
-    while idx < len(bounds):
-        if bounds[idx]["done_status"] == False:
-            break
-        idx += 1
-    return bounds[idx:]
-
-async def helper_single_object(object, params, failurefile=None, retries=5, caller="") -> None:
-        url, auth, logger, output_dir, session = params[0], params[1], params[2], params[3], params[4]
-
-        current_task = asyncio.current_task()
-        if "Task" in current_task.get_name():
-            task_name = object.replace("/","_").split("(")[0].split(".")[0]
-            if caller:
-                task_name = f"{caller}_{task_name}"
-            current_task.set_name(task_name)
-
-        if 'token_type' not in auth or 'access_token' not in auth:
-            logger.error(f"Missing token_type and access_token from auth. Did you auth correctly? (Skipping {object})")
-            return
-        url += object
-        if '?' in object:
-            object = object.split('?')[0]
-        if '/' in object:
-            temp = object.split('/')
-            object = '_'.join(temp)
-        name = object
-        logger.debug(name)
-
-        try:
-            header = {'Authorization': '%s %s' % (auth['token_type'], auth['access_token'])}
-            logger.info('Dumping %s information...' % (object))
-            outfile = os.path.join(output_dir, name + '.json')
-
-            async with session.get(url, headers=header, raise_for_status=True) as r:
-                result = await r.json()
-                nexturl = None
-
-                if 'value' not in result:
-                    if '@odata.context' in result:
-                        if '@odata.type' in result:
-                            result['value'].pop('@odata.type')
-                            with open(outfile, 'w', encoding='utf-8') as f:
-                                f.write(json.dumps(result) + '\n')
-                    elif 'error' in result:
-                        if result['error']['code'] == 'InvalidAuthenticationToken':
-                            return
-                        elif result['error']['code'] == 'Unauthorized':
-                            logger.error("Error with authentication token: " + result['error']['message'])
-                            logger.error("Please re-auth.")
-                            return
-                        else:
-                            logger.error("Error: " + result['error']['message'])
-                    else:
-                        logger.debug("Error with result: {}".format(str(result)))
-                        return
-                if 'value' in result:
-                    if result['value']:
-                        with open(outfile, 'w', encoding='utf-8') as f:
-                            for x in result['value']:
-                                if '@odata.type' in x:
-                                    x.pop('@odata.type')
-                                f.write(json.dumps(x) + '\n')
-                    elif not result['value']:
-                        logger.debug('%s has no information (size is 0). No output file.' % (outfile))
-                        with open(failurefile, 'a+', encoding='utf-8') as f:
-                            f.write('No output file: ' + name + ' - ' + str((datetime.now())) + '\n')
-                if '@odata.nextLink' in result:
-                    nexturl = result['@odata.nextLink']
-                    await get_nextlink(nexturl, outfile, session, logger, auth)
+                logger.error(f"HTTP error {e.resp.status}: {str(e)}")
+                return None
         except Exception as e:
-            try:
-                if e.status:
-                    if e.status == 429:
-                        logger.info('Sleeping for 60 seconds because of API throttle limit was exceeded.')
-                        await asyncio.sleep(60)
-                        retries -= 1
-                    elif e.status == 401:
-                        logger.error('Unauthorized message received. Exiting calls.')
-                        logger.error("Check auth to make sure it's not expired.")
-                        sys.exit(1)
-                        return
-                    elif e.status == 400:
-                        logger.error('Error received on ' + str(object) + ': '  + str(e))
-                        with open(failurefile, 'a+', encoding='utf-8') as f:
-                            f.write('Error: ' + name + ' - ' + str((datetime.now())) + '\n')
-                        return
-            except AttributeError as a:
-                logger.error('Error on nextLink retrieval: {}'.format(str(e)))
+            logger.error(f"Error on API call: {str(e)}")
+            if attempt < retries - 1:
+                await asyncio.sleep(delay)
+            else:
+                return None
+    return None
 
-        logger.info('Finished dumping %s information.' % (object))
+
+async def google_paginated_results(service_request, logger, retries=5, delay=60):
+    """
+    Handle Google API pagination using nextPageToken.
+
+    Args:
+        service_request: Initial API request object (not yet executed)
+        logger: Logger instance
+        retries: Number of retries per page
+        delay: Delay in seconds between retries
+
+    Yields:
+        Individual items from paginated results
+    """
+    from googleapiclient.errors import HttpError
+    request = service_request
+    while request is not None:
+        try:
+            response = request.execute()
+        except HttpError as e:
+            if e.resp.status == 429:
+                logger.info(f"Rate limited during pagination. Sleeping for {delay}s...")
+                await asyncio.sleep(delay)
+                continue
+            elif e.resp.status == 401:
+                logger.error(f"Unauthorized: {str(e)}. Please re-auth.")
+                sys.exit(1)
+            else:
+                logger.error(f"HTTP error during pagination: {str(e)}")
+                break
+        except Exception as e:
+            logger.error(f"Error during pagination: {str(e)}")
+            break
+
+        # Google APIs use various keys for their result arrays
+        for key in ['users', 'groups', 'members', 'items', 'activities',
+                     'roles', 'roleAssignments', 'domains', 'orgUnits',
+                     'chromeosdevices', 'mobiledevices', 'tokens',
+                     'alerts', 'usageReports', 'messages', 'filters',
+                     'delegates', 'forwardingAddresses', 'sendAs',
+                     'value', 'resources']:
+            if key in response:
+                for item in response[key]:
+                    yield item
+                break
+        else:
+            # If no known key, yield the whole response
+            yield response
+
+        # Get next page
+        if 'nextPageToken' in response:
+            # Build the next request with the page token
+            request = service_request
+            # We need to rebuild the request with the new page token
+            # This is handled by the list_next pattern in Google API client
+            break  # We'll use list_next pattern instead
+
+        request = None
+
+
+async def dump_google_api_results(service, request_builder, outfile, logger, key=None):
+    """
+    Paginate through Google API results and dump to a file.
+
+    Args:
+        service: The Google API service object (for list_next calls)
+        request_builder: Initial request (e.g., service.users().list(...))
+        outfile: Output file path
+        logger: Logger instance
+        key: The key in the response that contains the items (e.g., 'users', 'groups')
+    """
+    from googleapiclient.errors import HttpError
+    request = request_builder
+    total_items = 0
+    retries = 5
+    delay = 60
+
+    while request is not None:
+        for attempt in range(retries):
+            try:
+                response = request.execute()
+                break
+            except HttpError as e:
+                if e.resp.status == 429:
+                    logger.info(f"Rate limited. Sleeping for {delay}s (attempt {attempt+1}/{retries})...")
+                    await asyncio.sleep(delay)
+                elif e.resp.status == 401:
+                    logger.error(f"Unauthorized: {str(e)}. Please re-auth.")
+                    sys.exit(1)
+                elif e.resp.status >= 500:
+                    logger.warning(f"Server error ({e.resp.status}). Retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"HTTP error {e.resp.status}: {str(e)}")
+                    return total_items
+            except Exception as e:
+                logger.error(f"Error: {str(e)}")
+                return total_items
+        else:
+            logger.error("Max retries reached during pagination.")
+            return total_items
+
+        items = []
+        if key and key in response:
+            items = response[key]
+        elif not key:
+            # Try common Google API result keys
+            for k in ['users', 'groups', 'members', 'items', 'activities',
+                       'roles', 'roleAssignments', 'domains', 'orgUnits',
+                       'chromeosdevices', 'mobiledevices', 'tokens',
+                       'alerts', 'usageReports', 'messages', 'filters',
+                       'delegates', 'forwardingAddresses', 'sendAs',
+                       'resources']:
+                if k in response:
+                    items = response[k]
+                    break
+
+        if items:
+            with open(outfile, 'a+', encoding='utf-8') as f:
+                for item in items:
+                    f.write(json.dumps(item) + '\n')
+                f.flush()
+                os.fsync(f)
+            total_items += len(items)
+
+        # Use list_next for pagination
+        try:
+            request = service.list_next(request_builder, response)
+            request_builder = request  # Update for next iteration
+        except AttributeError:
+            request = None
+
+    return total_items
+
 
 class Lock:
     def __init__(self, fh):
@@ -771,7 +623,7 @@ def get_authfile(authfile=".auth", ugt_authfile=".ugt_auth", logger=logging, enc
 
     Arguments:
         authfile=".auth": Path to the authentication file that contains the user and app credentials
-        ugt_authfile=".ugt_auth": Path to the authentication file that contains the session json and cookies from authentication
+        ugt_authfile=".ugt_auth": Path to the authentication file that contains the session json from authentication
         logger=logging: Logger
 
     Returns:

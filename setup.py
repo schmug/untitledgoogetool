@@ -12,8 +12,8 @@ requirements_filepath = path.join(path.dirname(path.abspath(__file__)), "require
 requirements = open(requirements_filepath).read().split()
 
 setup(name='goosey',
-      version='2.0.4',
-      description='EntraID, Azure, M365, MDE Data Collector',
+      version='3.0.0',
+      description='Google Workspace, Gmail, GCP, Alert Center Data Collector',
       author='Claire Casalnova, Jordan Eberst, Nicholas Kantor, Wellington Lee, John Phelps, Victoria Wallace',
       classifiers=[
           'Intended Audience :: Information Technology',

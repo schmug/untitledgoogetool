@@ -2,11 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """Untitled Goose Tool: Csv!
-This module converts GUIDs to human readable text.
+This module converts IDs to human readable text for Google Workspace output.
 """
 
 import argparse
-from ast import parse
 import warnings
 import csv
 
@@ -25,7 +24,7 @@ def getargs(csv_parser) -> None:
                                '--output_dir',
                                action='store',
                                help='The directory where the goose files are located',
-                               default='output/entraid/')
+                               default='output/directory/')
     csv_parser.add_argument('-r',
                                '--result_dir',
                                action='store',
@@ -38,16 +37,13 @@ def getargs(csv_parser) -> None:
 
 def create_file_filter_dict():
     file_filter_dict = {
-        'users.json': ['id', 'userPrincipalName'],
-        'applications.json': ['id', 'displayName'],
-        'conditionalAccess_policies.json': ['id', 'displayName'],
-        'conditionalAccess_namedLocations.json': ['id', 'displayName'],
-        'devices.json': ['id', 'displayName'],
-        'directoryRoles.json': ['id', 'displayName'],
-        'groups.json': ['id', 'displayName'],
-        'roleManagement_directory_roleDefinitions.json': ['id', 'displayName'],
-        'servicePrincipals.json': ['id', 'displayName']
-
+        'users.json': ['primaryEmail', 'id'],
+        'groups.json': ['email', 'id'],
+        'org_units.json': ['name', 'orgUnitId'],
+        'roles.json': ['roleName', 'roleId'],
+        'domains.json': ['domainName', 'verified'],
+        'chromeos_devices.json': ['serialNumber', 'deviceId'],
+        'mobile_devices.json': ['email', 'deviceId'],
     }
     return file_filter_dict
 
@@ -62,16 +58,18 @@ def recurse_output_dir(output_dir, result_dir, file_filter_dict):
 def parse_file(input_file_name, input_file_path, fields, result_dir):
     file = input_file_name.split('.')[0] + ".csv"
     output_file = os.path.join(result_dir, file)
-    logger.debug("Creating %s GUID to Text csv.." % (input_file_name.split('.')[0]))
+    logger.debug("Creating %s ID to Text csv.." % (input_file_name.split('.')[0]))
     with open(output_file, "w+") as w:
         writer = csv.writer(w)
         writer.writerow(fields)
         with open(input_file_path, "r") as f:
             for line in f:
                 line = json.loads(line)
-                row = [line[fields[0]], line[fields[1]]]
+                row = []
+                for field in fields:
+                    row.append(line.get(field, ''))
                 writer.writerow(row)
-    logger.debug("Finished creating %s GUID to Text csv.." % (input_file_name.split('.')[0]))
+    logger.debug("Finished creating %s ID to Text csv.." % (input_file_name.split('.')[0]))
 
 def main(args=None) -> None:
     global logger
@@ -88,11 +86,11 @@ def main(args=None) -> None:
     recurse_output_dir(args.output_dir, args.result_dir, file_filter_dict)
     logger.info("Finished created CSV files.")
 
-def goosey_csv(output_dir="output/entraid/",
+def goosey_csv(output_dir="output/directory/",
 			  result_dir="output/csvs/",
 			  debug=False):
     """
-    Create csv files mapping GUIDs to text
+    Create csv files mapping IDs to text
 
     Args:
         output_dir: The directory where the goose files are located
